@@ -16,6 +16,8 @@ try:
 except ImportError:
     import sqlite3
 
+from .._sqlite_compat import fts5_quote_tokens
+
 logger = logging.getLogger(__name__)
 
 
@@ -1228,7 +1230,7 @@ class KnowledgeStore:
         self._load_graph()
 
     def search_items_fts(self, query, limit=10, offset=0) -> list:
-        safe = self._sanitize_fts5(query)
+        safe = " ".join(fts5_quote_tokens(query))
         if not safe:
             return []
         try:
@@ -1240,11 +1242,6 @@ class KnowledgeStore:
         except sqlite3.OperationalError:
             return []
         return [self._serialize_item(r) for r in rows]
-
-    @staticmethod
-    def _sanitize_fts5(query: str) -> str:
-        tokens = query.split()
-        return " ".join('"' + t.replace('"', '""') + '"' for t in tokens if t)
 
     def add_entity(self, name, entity_type, description=None, aliases=None) -> str:
         eid = str(uuid4())

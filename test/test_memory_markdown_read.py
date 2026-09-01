@@ -1173,7 +1173,7 @@ class TestLiteralFtsQuery:
 
 
 class TestOneEscapingDialect:
-    """Both FTS5 readers escape through the same primitive.
+    """Every reader that quotes a tokenized query goes through one primitive.
 
     Design review's point: a second hand-rolled quoter is how the tree ends up
     with divergent dialects and one of them wrong again.
@@ -1183,6 +1183,32 @@ class TestOneEscapingDialect:
         from kiro_crew._sqlite_compat import fts5_quote_tokens
 
         assert fts5_quote_tokens("PROJ-123 hooks.py") == ['"PROJ-123"', '"hooks.py"']
+
+    def test_no_undocumented_module_carries_its_own_fts5_quoting(self) -> None:
+        """Guard against the divergence the shared primitive exists to prevent.
+
+        A module that runs an FTS5 ``MATCH`` and doubles its own quotes owns a
+        private dialect. One does so deliberately and is listed here; any other
+        is a copy free to drift, which is how a character-identical duplicate of
+        this primitive survived in ``knowledge/store.py``.
+        """
+        import kiro_crew
+
+        root = Path(kiro_crew.__file__).parent
+        own_escape = "replace('\"', '\"\"')"
+        # Quotes one entity name as a single phrase, so it must not tokenize.
+        documented = {"dashboard/handlers/knowledge.py"}
+
+        offenders = {
+            path.relative_to(root).as_posix()
+            for path in root.rglob("*.py")
+            if "MATCH ?" in (text := path.read_text(encoding="utf-8", errors="replace"))
+            and own_escape in text
+        }
+        assert offenders == documented, (
+            f"undocumented FTS5 quoting dialect in {sorted(offenders - documented)}; "
+            f"delegate to fts5_quote_tokens or document why it differs"
+        )
 
     def test_the_join_differs_on_purpose(self) -> None:
         """Memory ANDs a deliberate query; knowledge ORs for recall."""

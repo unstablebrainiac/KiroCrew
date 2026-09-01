@@ -22,16 +22,23 @@ from functools import lru_cache
 def fts5_quote_tokens(query: str) -> list[str]:
     """Quote each whitespace-separated token of ``query`` for FTS5 MATCH.
 
-    One escaping dialect for every FTS5 reader in the tree. A token becomes a
-    quoted string, so FTS5 reads it as text rather than syntax: unquoted, ``-``
-    ``.`` and a bare ``AND`` are operators, which makes the everyday queries
-    (``PROJ-123``, ``hooks.py``) raise inside the driver. Internal double quotes
-    are doubled, the escape FTS5 defines for its own string literals.
+    The one escaping dialect for readers that quote a *tokenized* user query.
+    A token becomes a quoted string, so FTS5 reads it as text rather than
+    syntax: unquoted, ``-`` ``.`` and a bare ``AND`` are operators, which makes
+    the everyday queries (``PROJ-123``, ``hooks.py``) raise inside the driver.
+    Internal double quotes are doubled, the escape FTS5 defines for its own
+    string literals.
 
     Returns the tokens rather than a finished expression: how they are joined is
-    a per-surface product decision, not an escaping one. Memory search ANDs them
-    (the user typed every word deliberately); knowledge retrieval drops stopwords
-    and ORs them (natural-language recall).
+    a per-surface product decision, not an escaping one. Memory search and
+    knowledge item search AND them (the user typed every word deliberately);
+    knowledge retrieval drops stopwords and ORs them (natural-language recall).
+
+    Two other ``MATCH`` callers quote differently on purpose, and are not gaps
+    waiting to be closed: the entity-items handler quotes one entity name as a
+    single phrase rather than tokenizing it, and the personal-shopper store
+    extracts word-character runs, which cannot contain the quote character this
+    function escapes.
     """
     return ['"' + token.replace('"', '""') + '"' for token in query.split()]
 
