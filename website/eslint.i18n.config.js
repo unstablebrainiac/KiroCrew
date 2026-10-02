@@ -1072,6 +1072,14 @@ export default [
               // (utils/remoteEditorUrl.ts `REMOTE_EDITORS`): a product name, the same in
               // every language. Whole-value-anchored like the entries above.
               '^(VS Code|Kiro)$',
+              // The mouse the Logitech mouse haptics row names (`HAPTICS_MOUSE_MODEL`
+              // in pages/settings/NotificationsPanel.tsx), interpolated as
+              // `{{mouseModel}}`: a product name, the same in every language. It
+              // stays in code rather than a catalog because the inclusive-language
+              // gate flags the name's second word, and only a code line can carry
+              // that gate's exemption marker. Whole-value-anchored like the entries
+              // above.
+              '^MX Master 4$', // wokeignore:rule=master
               // The PPTX Maker chat-token KEYWORDS (`[Style: name]`,
               // `[Template: name]`). Enumerated and whole-value-anchored, exactly like
               // the modifier-key caps below: the agent prompts parse this literal

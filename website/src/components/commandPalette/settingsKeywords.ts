@@ -357,6 +357,7 @@ export const SETTINGS_KEYWORDS: Record<string, string[]> = {
   'kiro-account.kiro-sign-in': ['log out', 'logout', 'log-out', 'signout', 'sign-out', 'account', 'change account', 'another account', 'login', 'log in', 'credits', 'balance', 'usage', 'plan', 'not signed in to kiro'],
 
   // Notifications
+  'notifications.logitech-mouse-haptics': ['mouse vibration', 'vibrate the mouse', 'buzz my mouse on alerts', 'haptic feedback', 'logi options plugin', 'feel alerts without sound'],
   'notifications.mark-sessions-unread-only-when-they-need-you': ['unread only when needed', 'fewer unread chats', 'unread badge rules'],
   'notifications.mute-sounds': ['silence all sounds', 'no sounds', 'turn off sounds'],
   'notifications.notify-me-even-when-kiro-crew-is-closed': ['push notifications', 'notifications when closed', 'background notifications'],
