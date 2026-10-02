@@ -17,6 +17,7 @@ if TYPE_CHECKING:
         _STRUCTURED_CONTENT_MAX_CHARS,
         _STRUCTURED_CONTENT_PLACEHOLDER,
         COLOR_HEX_RE,
+        MERGED_FROM_MAX_CREATED_AT_CHARS,
         DashboardState,
         ResumeOutcome,
         ResumeRefusal,
@@ -37,6 +38,7 @@ if TYPE_CHECKING:
         _redact_meta_for_role,
         _rehydrate_slot_title,
         _restore_dismissed_source_links,
+        _restore_fork_lineage,
         _restore_model_fields,
         _restored_agent_name,
         _restored_mode,
@@ -56,9 +58,11 @@ if TYPE_CHECKING:
         read_bounded_json,
         redact_credentials,
         redact_exfiltration_urls,
+        restore_deferred_note_hold,
         sel,
         slot_history_key,
         time,
+        transcripts_share_file,
     )
 
 
@@ -221,7 +225,9 @@ async def _live_slot_for_resume(
     existing = state._slots.get(name)
     if not existing:
         for slot in state._slots.values():
-            if effective_session_key(slot) == canonical:
+            if effective_session_key(slot) == canonical or transcripts_share_file(
+                slot_history_key(slot), history_key
+            ):
                 existing = slot
                 break
     if existing:
@@ -760,8 +766,7 @@ def _hydrate_slot_from_history(
         state._restricted_keys.add(f"dashboard:{slot.key}")
     else:
         state._restricted_keys.discard(f"dashboard:{slot.key}")
-    if meta.get("forked_from") is not None:
-        slot.forked_from = meta["forked_from"]
+    _restore_fork_lineage(slot, meta)
     disk_total = len(all_messages)
     # ``window_limit`` is a fact about the data, not a caller switch: how many of
     # the newest rows to surface as the live window, given that any rows before
@@ -816,6 +821,9 @@ def _hydrate_slot_from_history(
         # the window that the next save re-serializes.
         carry_provenance(slot.messages[-1], m)
         _attach_variants(slot, m)
+    restore_deferred_note_hold(
+        slot, meta.get("deferred_notes"), all_messages, slot_history_key(slot)
+    )
     slot.drain()
     slot._resumed_count = len(slot.messages)
     # Loaded window is the on-disk window region; older lines (in
@@ -864,6 +872,22 @@ async def api_chat_slot_resume(request: web.Request) -> web.Response:
     if body_err is not None:
         return body_err
     assert body is not None  # read_bounded_json returns (dict, None) on success
+    expected_created_at: str | None = None
+    if "expected_created_at" in body:
+        candidate = body.get("expected_created_at")
+        if (
+            not isinstance(candidate, str)
+            or not candidate
+            or len(candidate) > MERGED_FROM_MAX_CREATED_AT_CHARS
+        ):
+            return web.json_response(
+                {
+                    "error": "expected transcript identity is invalid",
+                    "code": "invalid_expected_created_at",
+                },
+                status=400,
+            )
+        expected_created_at = candidate
     outcome = await resume_slot_from_history(
         state,
         name=name,
@@ -871,6 +895,7 @@ async def api_chat_slot_resume(request: web.Request) -> web.Response:
         request_app=request_app,
         caller_label=request.remote or "",
         request_title=body.get("title", ""),
+        expected_created_at=expected_created_at,
     )
     if outcome.refusal is not None:
         return _resume_refusal_response(outcome.refusal)
@@ -915,6 +940,7 @@ async def resume_slot_from_history(
     request_app: str = "",
     caller_label: str = "",
     request_title: str = "",
+    expected_created_at: str | None = None,
     containment: "Callable[[_ChatSlot], Awaitable[ResumeRefusal | None]] | None" = None,
     final_check: "Callable[[_ChatSlot], ResumeRefusal | None] | None" = None,
 ) -> ResumeOutcome:
@@ -927,7 +953,10 @@ async def resume_slot_from_history(
     under (any spelling ``_normalize_slot_key`` folds), ``history_key`` the
     transcript to load (``None`` means ``name``), ``request_app`` the app token's
     scope when the caller is an app (empty for the dashboard user and for
-    session control), and ``caller_label`` what SEL records as the caller.
+    session control), ``caller_label`` what SEL records as the caller,
+    ``request_title`` the fallback title when the transcript stores none, and
+    ``expected_created_at`` an optional transcript identity that must match before
+    an existing or hydrated slot is returned.
 
     ``containment`` is a caller's LAST gate before publish. It runs once the slot
     is hydrated -- so it reads the fields the slot actually carries, not a
@@ -992,8 +1021,8 @@ async def resume_slot_from_history(
         return ResumeOutcome(refusal=ResumeRefusal("not found", "slot_not_found", 404))
 
     # If slot already exists (active session), just return it — no duplicate.
-    # Check both by slot name AND by canonical session key to prevent two
-    # slots sharing the same kiro-cli process.
+    # Check by slot name, by canonical session key and by transcript file, so two
+    # slots never share one kiro-cli process or write one file.
     #
     # INVARIANT: both sides of this comparison derive identity through the same
     # rule. A slot answers with ``effective_session_key``, which for a
@@ -1001,10 +1030,26 @@ async def resume_slot_from_history(
     # the same way, via the session map. Two rules in play and a channel
     # transcript matches nothing here: it gets a second tab, so one conversation
     # shows as two sidebar rows backed by two kiro-cli processes.
+    #
+    # The file check covers what the session map cannot bind: an unbound channel
+    # tab's ``slack_<ts>`` stem and its ``slack:<ts>`` key name one file
+    # (``transcripts_share_file``). A second slot over it would write that file
+    # beside the first and restore its held notes and merge-card context again.
     resume_outcome = await _live_slot_for_resume(
         state, request_app, history_key, name, caller_label
     )
     if resume_outcome is not None:
+        if expected_created_at is not None and (
+            resume_outcome.slot is None
+            or str(resume_outcome.slot.created_at or "") != expected_created_at
+        ):
+            return ResumeOutcome(
+                refusal=ResumeRefusal(
+                    "the requested session is no longer available",
+                    "resume_identity_mismatch",
+                    409,
+                )
+            )
         return resume_outcome
 
     # Boundary for the compare-and-clear below, captured BEFORE the metadata read
@@ -1022,7 +1067,20 @@ async def resume_slot_from_history(
     # persisted origin stays empty (get_or_create_slot then derives APP for an
     # app token, otherwise leaves it untagged, which is invisible to cross-slot
     # scopes) rather than claiming USER on a conversation we cannot attribute.
-    meta = state.conversation_log.get_metadata(history_key)
+    if expected_created_at is None:
+        meta = await asyncio.to_thread(state.conversation_log.get_metadata, history_key)
+    else:
+        meta, meta_readable = await asyncio.to_thread(
+            state.conversation_log.get_metadata_status, history_key
+        )
+        if not meta_readable or str(meta.get("created_at") or "") != expected_created_at:
+            return ResumeOutcome(
+                refusal=ResumeRefusal(
+                    "the requested session is no longer available",
+                    "resume_identity_mismatch",
+                    409,
+                )
+            )
 
     # ── Member-thread EARLY refusal, before any persistent mutation ────────
     # ``_unhide_folder`` and ``clear_closed`` below write durable state. A
@@ -1183,6 +1241,17 @@ async def resume_slot_from_history(
         state, request_app, history_key, name, caller_label
     )
     if resume_outcome is not None:
+        if expected_created_at is not None and (
+            resume_outcome.slot is None
+            or str(resume_outcome.slot.created_at or "") != expected_created_at
+        ):
+            return ResumeOutcome(
+                refusal=ResumeRefusal(
+                    "the requested session is no longer available",
+                    "resume_identity_mismatch",
+                    409,
+                )
+            )
         return resume_outcome
 
     # Re-check DELETION in the same window and for the same reason. The transcript
