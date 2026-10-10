@@ -556,7 +556,16 @@ starts and keeps that account for life, so an out-of-band account switch or
 logout leaves running children answering turns on the previous account. The
 retirement machinery detects and recycles them, in `session_lifecycle.py`
 (`retire_kiro_identity_sessions`) driven by the per-turn gate in
-`chat_runner.py`, against baselines owned by `KiroPrerequisiteService`.
+`chat_runner.py` (`_retire_sessions_on_identity_change`), against baselines
+owned by `KiroPrerequisiteService`. The gate runs before each dashboard chat
+turn acquires its session (`_run_chat`) and before each agent cron run does
+(`_acquire_with_model_fallback` in `slack/gateway.py`, every `agent_sequence`
+step included). A `cron:` key never claims a warm-pool process
+(`bypass_stateless`), so the child that can still hold the previous account is
+the cron's own session: a fire whose sub-agents are still running skips the
+reset in its `finally`, and the next fire of a `persistent_session` job, or of
+the same `agent_sequence` step, reuses that live session. A host where only
+crons run has no dashboard turn to retire it.
 
 **Identity fingerprint** (`current_identity_fingerprint`): one string over
 every credential source a child may have loaded, each kept as its OWN
@@ -1132,10 +1141,11 @@ against sweep completeness, and are torn down at `close_all`.
   neither axis, even after its job is deleted. The RSS recycle, when enabled, or
   a restart still ends it. So does the identity sweep
   (`retire_kiro_identity_sessions`, which reads no list). Before each dashboard
-  chat turn (`_retire_sessions_on_identity_change` in `chat_runner.py`) it
-  retires a kiro-backed one once the live Kiro account is no longer the one it
-  was spawned under, so an account change made outside the dashboard reaches
-  such a session at the next dashboard chat turn. A Kiro sign-out from the
+  chat turn and each agent cron run (`_retire_sessions_on_identity_change` in
+  `chat_runner.py`) it retires a kiro-backed one once the live Kiro account is
+  no longer the one it was spawned under, so an account change made outside the
+  dashboard reaches such a session at the next dashboard chat turn or agent cron
+  run. A Kiro sign-out from the
   dashboard runs it at once with no live account, which retires every idle
   kiro-backed session, whatever account each signed in with; a busy one is
   flagged and retired later (see "Account-identity retirement").
