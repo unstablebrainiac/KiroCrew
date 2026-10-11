@@ -10,9 +10,12 @@ module never imports that facade.
 
 from __future__ import annotations
 
+import json
 import re
+import string
 from typing import Any
 
+from kiro_crew.apps.manifest_names import APP_NAME_MAX_LENGTH
 from kiro_crew.constants import MAX_SHORT_STRING
 from kiro_crew.validation_parts.field_engine import FieldSpec, ToolSchema, ValidationError
 from kiro_crew.validation_parts.input_bounds import MAX_MEDIUM_STRING
@@ -139,6 +142,62 @@ POD_STATUS_SCHEMA = ToolSchema(
 # MCP_CORE_SCHEMAS has its arguments passed through raw, so an empty schema is
 # what makes an unexpected argument an "Error:" string instead of unvalidated input.
 POD_LS_SCHEMA = ToolSchema(tool_name="pod_ls", fields=[])
+
+# ``app_request`` calls one of an installed app's declared ``agentRoutes``. The
+# path is a CONCRETE path (parameters filled in), restricted to characters that
+# survive the gateway's URL decoding unchanged, so the route the tool checks
+# locally is the route the gateway matches. No ``%``: a decoded ``%2F`` would add
+# a segment after the local check passed.
+APP_REQUEST_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
+_APP_REQUEST_APP_NAME_CHARS = frozenset(string.ascii_lowercase + string.digits)
+_APP_REQUEST_PATH_SEGMENT_CHARS = frozenset(string.ascii_letters + string.digits + "._~:@+-")
+# A URL path separator, not a filesystem one: HTTP paths use "/" on every OS.
+_APP_REQUEST_PATH_SEPARATOR = "/"
+# Same bound as the Ops Mission Control body, the nearest existing agent surface.
+_APP_REQUEST_MAX_BODY = 32_768
+
+
+def _is_app_request_app_name(app: str) -> bool:
+    """Lowercase letter-or-digit words joined by single hyphens."""
+    return all(part and set(part) <= _APP_REQUEST_APP_NAME_CHARS for part in app.split("-"))
+
+
+def _is_app_request_path(path: str) -> bool:
+    """One or more ``/segment`` parts, each non-empty and inside the fixed set."""
+    if not path.startswith(_APP_REQUEST_PATH_SEPARATOR):
+        return False
+    segments = path[1:].split(_APP_REQUEST_PATH_SEPARATOR)
+    return all(segment and set(segment) <= _APP_REQUEST_PATH_SEGMENT_CHARS for segment in segments)
+
+
+def _validate_app_request(cleaned: dict[str, Any]) -> None:
+    if not _is_app_request_app_name(cleaned["app"]):
+        raise ValidationError("app", "invalid format")
+    if not _is_app_request_path(cleaned["path"]):
+        raise ValidationError("path", "invalid format")
+    body = cleaned.get("body")
+    if body is None:
+        return
+    if cleaned.get("method") == "GET":
+        # An empty object carries nothing, so it is the same call as no body.
+        if body:
+            raise ValidationError("body", "GET calls take no body")
+        return
+    if len(json.dumps(body, ensure_ascii=False, default=str)) > _APP_REQUEST_MAX_BODY:
+        raise ValidationError("body", f"body exceeds {_APP_REQUEST_MAX_BODY} characters")
+
+
+APP_REQUEST_SCHEMA = ToolSchema(
+    tool_name="app_request",
+    fields=[
+        FieldSpec("app", str, required=True, max_len=APP_NAME_MAX_LENGTH),
+        FieldSpec("method", str, required=True, allowed=APP_REQUEST_METHODS),
+        FieldSpec("path", str, required=True, max_len=512),
+        FieldSpec("body", dict),
+    ],
+    custom_validator=_validate_app_request,
+)
+
 
 ISSUE_RADAR_RECORD_INVESTIGATION_SCHEMA = ToolSchema(
     tool_name="issue_radar_record_investigation",
