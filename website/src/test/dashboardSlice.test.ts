@@ -5,6 +5,8 @@ import reducer, {
   sseConnected,
   sseDisconnected,
   sseSlots,
+  sseSlotsPartial,
+  sseSlotListHolds,
   touchSlotActivity,
   sseSlotTitle,
   addSlotOptimistic,
@@ -212,12 +214,142 @@ describe('dashboardSlice', () => {
   })
 
   it('fetchSlots.fulfilled reconciles unreadSlots against live slots', () => {
-    let state = reducer(initial, sseSlots([slot1, slot2]))
+    // A complete slots frame has released the boot-time unread hold.
+    let state = reducer(initial, sseSlotsPartial(false))
+    state = reducer(state, sseSlots([slot1, slot2]))
     state = reducer(state, markSlotUnread('chat-1'))
     state = reducer(state, markSlotUnread('chat-2'))
     // Simulate fetchSlots returning only slot2 (slot1 was deleted remotely)
     state = reducer(state, fetchSlots.fulfilled([slot2], 'requestId'))
     expect(state.unreadSlots).toEqual(['chat-2'])
+  })
+
+  describe('unread drain hold (partial slot list)', () => {
+    // A gateway mid-restart labels its slots frames `slotsPartial` while
+    // sessions are still being restored. A session not yet restored is absent
+    // from such a list without having been deleted, so the drain that clears a
+    // remotely deleted slot's badge must wait for a complete list.
+    it('holds the drain from boot until a complete frame arrives', () => {
+      expect(initial.unreadDrainHeld).toBe(true)
+      const released = reducer(initial, sseSlotsPartial(false))
+      expect(released.unreadDrainHeld).toBe(false)
+      expect(reducer(released, sseSlotsPartial(true)).unreadDrainHeld).toBe(true)
+    })
+
+    it('re-arms the hold on every connect', () => {
+      const released = reducer(initial, sseSlotsPartial(false))
+      expect(reducer(released, sseConnected()).unreadDrainHeld).toBe(true)
+    })
+
+    it('a complete list drains other unread keys but preserves held keys', () => {
+      const slot3 = { ...slot1, key: 'chat-3', title: 'Chat 3' }
+      let state = reducer(initial, sseSlotsPartial(false))
+      state = reducer(state, sseSlots([slot1, slot2, slot3]))
+      state = reducer(state, markSlotUnread('chat-1'))
+      state = reducer(state, markSlotUnread('chat-3'))
+      state = reducer(state, sseSlotListHolds({ heldKeys: ['chat-1'], holdChannels: false }))
+
+      state = reducer(state, sseSlots([slot2]))
+
+      expect(state.unreadSlots).toEqual(['chat-1'])
+    })
+
+    it('a channel-wide hold preserves channel unread keys while draining ordinary keys', () => {
+      const channel = { ...slot1, key: 'slack_1.1', title: 'Slack thread' }
+      let state = reducer(initial, sseSlotsPartial(false))
+      state = reducer(state, sseSlots([channel, slot1]))
+      state = reducer(state, markSlotUnread('slack_1.1'))
+      state = reducer(state, markSlotUnread('chat-1'))
+      state = reducer(state, sseSlotListHolds({ heldKeys: [], holdChannels: true }))
+
+      state = reducer(state, sseSlots([]))
+
+      expect(state.unreadSlots).toEqual(['slack_1.1'])
+    })
+
+    it('an HTTP list cannot clear hold state delivered by the WebSocket', () => {
+      const slot3 = { ...slot1, key: 'chat-3', title: 'Chat 3' }
+      let state = reducer(initial, sseSlotsPartial(false))
+      state = reducer(state, sseSlots([slot1, slot2, slot3]))
+      state = reducer(state, markSlotUnread('chat-1'))
+      state = reducer(state, markSlotUnread('chat-3'))
+      state = reducer(state, sseSlotListHolds({ heldKeys: ['chat-3'], holdChannels: false }))
+
+      state = reducer(state, fetchSlots.fulfilled([slot2], 'held-keys-response'))
+
+      expect(state.unreadSlots).toEqual(['chat-3'])
+    })
+
+    it('a GET started after disconnect cannot drain an absent unread key', () => {
+      let state = reducer(initial, sseSlotsPartial(false))
+      state = reducer(state, sseSlots([slot1, slot2]))
+      state = reducer(state, markSlotUnread({ slot: 'chat-1', ts: '2026-01-01T00:00:00Z' }))
+      expect(state.unreadDrainHeld).toBe(false)
+
+      state = reducer(state, sseDisconnected())
+      state = reducer(state, fetchSlots.pending('disconnected-request', undefined))
+      state = reducer(state, fetchSlots.fulfilled([slot2], 'disconnected-request', undefined))
+
+      expect(state.unreadSlots).toEqual(['chat-1'])
+      expect(state.unreadSince['chat-1']).toBe('2026-01-01T00:00:00Z')
+    })
+
+    it('a GET reply during the hold does not drain an absent key', () => {
+      // The reply was requested on connect and can land before the connect
+      // snapshot says whether the list is complete; the hold set by
+      // `sseConnected` covers it.
+      let state = reducer(initial, sseSlotsPartial(false))
+      state = reducer(state, sseSlots([slot1, slot2]))
+      state = reducer(state, markSlotUnread({ slot: 'chat-1', ts: '2026-01-01T00:00:00Z' }))
+      state = reducer(state, sseConnected())
+      state = reducer(state, fetchSlots.fulfilled([slot2], 'requestId'))
+      expect(state.slots.map(s => s.key)).toEqual(['chat-2'])
+      expect(state.unreadSlots).toEqual(['chat-1'])
+      expect(state.unreadSince['chat-1']).toBe('2026-01-01T00:00:00Z')
+      expect(Object.keys(JSON.parse(localStorage.getItem('mc-unread-shared') ?? '{}'))).toContain('chat-1')
+      // The first complete frame drains what is genuinely gone.
+      state = reducer(state, sseSlotsPartial(false))
+      state = reducer(state, sseSlots([slot2]))
+      expect(state.unreadSlots).toEqual([])
+      expect(state.unreadSince['chat-1']).toBeUndefined()
+      expect(Object.keys(JSON.parse(localStorage.getItem('mc-unread-shared') ?? '{}'))).not.toContain('chat-1')
+    })
+
+    it('a GET started during the hold cannot drain after a complete frame releases it', () => {
+      localStorage.clear()
+      let state = reducer(initial, sseSlotsPartial(false))
+      state = reducer(state, sseSlots([slot1, slot2]))
+      state = reducer(state, markSlotUnread({ slot: 'chat-1', ts: '2026-01-01T00:00:00Z' }))
+      state = reducer(state, sseConnected())
+      state = reducer(state, fetchSlots.pending('held-request', undefined))
+      state = reducer(state, sseSlotsPartial(false))
+      state = reducer(state, sseSlots([slot1, slot2]))
+      expect(state.unreadDrainHeld).toBe(false)
+
+      state = reducer(state, fetchSlots.fulfilled([slot2], 'held-request', undefined))
+
+      expect(state.unreadSlots).toEqual(['chat-1'])
+      expect(state.unreadSince['chat-1']).toBe('2026-01-01T00:00:00Z')
+      expect(JSON.parse(localStorage.getItem('mc-unread-shared') ?? '{}')).toMatchObject({
+        'chat-1': '2026-01-01T00:00:00Z',
+      })
+      expect(state.slotFetchWriteMark['held-request']).toBeUndefined()
+    })
+
+    it('a GET started after the hold clears still drains an absent key', () => {
+      localStorage.clear()
+      let state = reducer(initial, sseSlotsPartial(false))
+      state = reducer(state, sseSlots([slot1, slot2]))
+      state = reducer(state, markSlotUnread({ slot: 'chat-1', ts: '2026-01-01T00:00:00Z' }))
+      state = reducer(state, fetchSlots.pending('unheld-request', undefined))
+
+      state = reducer(state, fetchSlots.fulfilled([slot2], 'unheld-request', undefined))
+
+      expect(state.unreadSlots).toEqual([])
+      expect(state.unreadSince['chat-1']).toBeUndefined()
+      expect(JSON.parse(localStorage.getItem('mc-unread-shared') ?? '{}')).not.toHaveProperty('chat-1')
+      expect(state.slotFetchWriteMark['unheld-request']).toBeUndefined()
+    })
   })
 
   it('triggerRefresh increments counter', () => {
@@ -604,6 +736,8 @@ describe('dashboardSlice per-slot sub-agent teardown', () => {
       subagentRunning: { 'chat-1': 1, 'chat-2': 2 },
       subagentDetails: { 'chat-1': [], 'chat-2': [] },
       subagentText: { 'chat-1': {}, 'chat-2': {} },
+      // Steady state: a complete slots frame has released the boot-time hold.
+      unreadDrainHeld: false,
     }
   }
 

@@ -7,7 +7,7 @@ import { ApiError } from '../api/apiError'
 import { sanitizeLlmOutput, isUnsafeKey } from '../utils/sanitize'
 import type { StatusData, ChatSlot, TodoList, McpSessionReport } from '../types'
 import type { SessionColorMode, PaletteName, DefaultColorSetting, IntensityName } from '../utils/sessionColors'
-import { isChatPageSurface } from '../utils/channelOrigin'
+import { isChatPageSurface, slotChannelNamespace } from '../utils/channelOrigin'
 
 export interface SubagentDetail {
   id: string; task: string; agent: string; turns: number; last_tool: string; startedAt: number
@@ -118,12 +118,19 @@ interface DashboardState {
    *  re-adds — no consumption step is needed. Pruned with the rest of the
    *  per-slot state when an authoritative frame drops the key. */
   slotMemberAt: Record<string, number>
-  /** Per in-flight `fetchSlots` requestId, the value of `slotWriteSeq` when the
-   *  request was dispatched. The server serialized its reply after that instant,
-   *  so any key whose `slotWrittenAt` is HIGHER was written locally while the
-   *  reply travelled and the reply is older than the screen for that key.
-   *  Entries leave when the request settles. */
-  slotFetchWriteMark: Record<string, number>
+  /** Per in-flight `fetchSlots` requestId, the write sequence and unread-drain
+   *  hold state when the request was dispatched. The server serialized its reply
+   *  after that instant, so any key whose `slotWrittenAt` is HIGHER was written
+   *  locally while the reply travelled and the reply is older than the screen for
+   *  that key. A reply started under the unread hold cannot become safe to drain
+   *  merely because a complete WebSocket frame arrives before it. Entries leave
+   *  when the request settles. */
+  slotFetchWriteMark: Record<string, {
+    writeSeq: number
+    unreadDrainHeld: boolean
+    heldKeys: string[]
+    holdChannels: boolean
+  }>
   // Slot keys in the order the session sidebar actually DISPLAYS them
   // (pinned-first + the user's sort, flat-view aware). Published by
   // ChatSidebar; consumed by the chat-jump / chat-cycle keyboard shortcuts and
@@ -150,6 +157,18 @@ interface DashboardState {
    *  as ONE shared record entry written atomically, so the pair can never
    *  tear apart and there are no orphans to reconcile at boot. */
   unreadSince: Record<string, string>
+  /** While true, `reconcileSlots` keeps every unread entry whose key the slot
+   *  list omits instead of draining it. True from boot and from every
+   *  disconnect or `sseConnected` until a `slots` frame arrives without
+   *  `slotsPartial`: a gateway mid-restart labels the lists it pushes while sessions are still
+   *  being restored, and draining against one of those would clear the badge
+   *  of a session that merely has not been listed yet. Only the drain is
+   *  held; the list itself renders and evicts as usual. */
+  unreadDrainHeld: boolean
+  /** Known omitted keys that remain unsafe to drain after the global hold clears. */
+  slotsHeldKeys: string[]
+  /** Hold every channel-origin key when the gateway could not list channel sessions. */
+  slotsHoldChannels: boolean
   slotsLoaded: boolean
   updateProgress: { step: string; detail: string } | null
   // Desktop updater: an update is discoverable/staged (found|downloading|
@@ -346,6 +365,9 @@ const initialState: DashboardState = {
   channelTrusted: false,
   refreshTrigger: 0,
   ...(() => { const since = restoreUnreadSince(); return { unreadSlots: restoreUnreadBadges(since), unreadSince: since } })(),
+  unreadDrainHeld: true,
+  slotsHeldKeys: [],
+  slotsHoldChannels: false,
   slotsLoaded: false,
   updateProgress: null,
   desktopUpdateAvailable: false,
@@ -417,27 +439,52 @@ export const changeApprovalMode = createAsyncThunk<
  *  through here, so the two cannot drift apart the way the eviction lists this
  *  PR unified once did. `unreadSlots` is written back only when it actually
  *  shrank, since the live-frame writer runs on every slots frame. */
-const reconcileSlots = (state: DashboardState, liveKeys: Set<string>, evictStale = true): void => {
+const drainUnreadKeys = (state: DashboardState, keys: Set<string>): void => {
+  const unread = state.unreadSlots ?? []
+  const dropped = unread.filter(key => keys.has(key))
+  if (dropped.length === 0) return
+  if (state.unreadSince) {
+    let droppedManual = false
+    for (const key of dropped) {
+      if (state.unreadSince[key] === MANUAL_UNREAD) droppedManual = true
+      delete state.unreadSince[key]
+    }
+    if (droppedManual) persistManualSentinels(state.unreadSince)
+  }
+  state.unreadSlots = unread.filter(key => !keys.has(key))
+  persistSharedUnread({}, dropped)
+  _relayUnreadToParent(JSON.stringify(state.unreadSlots))
+}
+
+const reconcileSlots = (
+  state: DashboardState,
+  liveKeys: Set<string>,
+  evictStale = true,
+  unreadDrainHeld = state.unreadDrainHeld,
+  heldKeys = state.slotsHeldKeys,
+  holdChannels = state.slotsHoldChannels,
+): void => {
   // `countUnreadByMode` deliberately keeps orphan unread keys contributing to
   // the badge, on the premise that a reconcile drains them shortly. Draining on
   // both writers is what keeps that premise true. Always run: a wrongly drained
   // badge self-heals on the next unread event, and the refetch is the documented
   // route by which a remotely deleted slot's badge is cleared.
-  const unread = state.unreadSlots ?? []
-  const drained = unread.filter(k => liveKeys.has(k))
-  if (drained.length !== unread.length) {
-    // unreadSince tolerates partial preloaded test state, like `?? []` above.
-    if (state.unreadSince) {
-      let droppedManual = false
-      for (const k of unread) if (!liveKeys.has(k)) {
-        if (state.unreadSince[k] === MANUAL_UNREAD) droppedManual = true
-        delete state.unreadSince[k]
-      }
-      if (droppedManual) persistManualSentinels(state.unreadSince)
-    }
-    state.unreadSlots = drained
-    persistSharedUnread({}, unread.filter(k => !liveKeys.has(k)))
-    _relayUnreadToParent(JSON.stringify(state.unreadSlots))
+  //
+  // The one exception is a list the gateway labelled partial (`unreadDrainHeld`):
+  // a session it has not restored yet is absent from that list without having
+  // been deleted, and a drain here would be the lossy direction. The hold covers
+  // a GET reply too, since it goes through this same path. Deferring the drain
+  // is safe: the next complete list drains whatever is genuinely gone.
+  if (!unreadDrainHeld) {
+    const held = new Set((heldKeys ?? []).flatMap(key => [
+      key,
+      isUnsafeKey(key) ? `unsafe-key:${key}` : key,
+    ]))
+    drainUnreadKeys(state, new Set((state.unreadSlots ?? []).filter(key => (
+      !liveKeys.has(key)
+      && !held.has(key)
+      && !(holdChannels && slotChannelNamespace(key))
+    ))))
   }
   // Eviction is NOT recoverable, so it is skipped when the caller cannot vouch
   // for the list's freshness: an HTTP reply in flight can be older than the live
@@ -763,7 +810,7 @@ const patchSlotRowsWhere = (state: DashboardState, patch: RowPatch): void => {
 const localWritesOutranking = (state: DashboardState, requestId: string | undefined): Set<string> => {
   const outranked = new Set<string>()
   if (requestId === undefined) return outranked
-  const mark = state.slotFetchWriteMark?.[requestId]
+  const mark = state.slotFetchWriteMark?.[requestId]?.writeSeq
   if (mark === undefined) return outranked
   const writtenAt = state.slotWrittenAt ?? {}
   for (const stamped of Object.keys(writtenAt)) {
@@ -788,7 +835,7 @@ const localWritesOutranking = (state: DashboardState, requestId: string | undefi
 const membersOutranking = (state: DashboardState, requestId: string | undefined): Set<string> => {
   const added = new Set<string>()
   if (requestId === undefined) return added
-  const mark = state.slotFetchWriteMark?.[requestId]
+  const mark = state.slotFetchWriteMark?.[requestId]?.writeSeq
   if (mark === undefined) return added
   const memberAt = state.slotMemberAt ?? {}
   for (const stamped of Object.keys(memberAt)) {
@@ -954,8 +1001,19 @@ const dashboardSlice = createSlice({
       state.savedYoloDuration = action.payload
       if (state.status) state.status.yolo_duration = action.payload
     },
-    sseConnected(state) { state.connected = true; state.slotsLoaded = false; state.subagentRunning = {}; state.subagentDetails = {}; state.subagentText = {} },
-    sseDisconnected(state) { state.connected = false },
+    sseConnected(state) { state.connected = true; state.slotsLoaded = false; state.unreadDrainHeld = true; state.slotsHeldKeys = []; state.slotsHoldChannels = false; state.subagentRunning = {}; state.subagentDetails = {}; state.subagentText = {} },
+    sseDisconnected(state) { state.connected = false; state.unreadDrainHeld = true },
+    /** The `slotsPartial` label on a `slots` frame (see `unreadDrainHeld`).
+     *  Dispatched for every frame, before its list: an absent field is an
+     *  older gateway and reads as complete. */
+    sseSlotsPartial(state, action: PayloadAction<boolean>) { state.unreadDrainHeld = action.payload },
+    sseSlotListHolds(
+      state,
+      action: PayloadAction<{ heldKeys: string[]; holdChannels: boolean }>,
+    ) {
+      state.slotsHeldKeys = action.payload.heldKeys
+      state.slotsHoldChannels = action.payload.holdChannels
+    },
     sseSlots(state, action: PayloadAction<ChatSlot[]>) {
       // Read before `slotsLoaded` is set: an empty frame is ambiguous, and this
       // is what disambiguates it. Not yet loaded means a reconnect delivered it
@@ -1063,8 +1121,12 @@ const dashboardSlice = createSlice({
           Object.assign(slot, fields)
         })
       }
-      if (removed?.length && state.slotsLoaded) {
-        const gone = new Set(removed)
+      const gone = new Set((removed ?? []).filter(key => !isUnsafeKey(key)))
+      // A removal names a slot the server has durably deleted. Unlike a key
+      // merely absent from a partial list, it is safe to drain during restart
+      // and before the first complete snapshot.
+      drainUnreadKeys(state, gone)
+      if (gone.size && state.slotsLoaded) {
         for (const key of gone) {
           if (!isUnsafeKey(key) && !state.closingSlots?.[key]) {
             markStaleSlotFetches(state, key, [...(state.slotFetchesInFlight ?? [])])
@@ -1517,7 +1579,12 @@ const dashboardSlice = createSlice({
         // The reply cannot describe anything that happens from here on, so this
         // is the instant every later single-slot write outranks it from.
         if (!state.slotFetchWriteMark) state.slotFetchWriteMark = {}
-        state.slotFetchWriteMark[action.meta.requestId] = state.slotWriteSeq ?? 0
+        state.slotFetchWriteMark[action.meta.requestId] = {
+          writeSeq: state.slotWriteSeq ?? 0,
+          unreadDrainHeld: state.unreadDrainHeld,
+          heldKeys: [...(state.slotsHeldKeys ?? [])],
+          holdChannels: state.slotsHoldChannels,
+        }
       })
       .addCase(fetchSlots.fulfilled, (state, action) => {
         // A reply a confirmed close waited on past its cap is known to predate
@@ -1533,6 +1600,7 @@ const dashboardSlice = createSlice({
         // one stale row.
         // `meta` is optional-chained for the hand-built actions in older tests.
         const requestId = action.meta?.requestId
+        const requestMark = requestId ? state.slotFetchWriteMark?.[requestId] : undefined
         const staleKeys = requestId ? staleKeysForSlotFetch(state, requestId) : new Set<string>()
         // Keys a single-slot writer touched while this request was in flight.
         // The server serialized the reply before that write existed, so for
@@ -1618,7 +1686,14 @@ const dashboardSlice = createSlice({
         applySlots(state, rows)
         state.slotsGeneration = (state.slotsGeneration ?? 0) + 1
         state.slotsLoaded = true
-        reconcileSlots(state, new Set(rows.map((s: { key: string }) => s.key)), fresh)
+        reconcileSlots(
+          state,
+          new Set(rows.map((s: { key: string }) => s.key)),
+          fresh,
+          state.unreadDrainHeld || requestMark?.unreadDrainHeld === true,
+          [...(requestMark?.heldKeys ?? []), ...(state.slotsHeldKeys ?? [])],
+          state.slotsHoldChannels || requestMark?.holdChannels === true,
+        )
         settleSlotFetch(state, requestId)
       })
       .addCase(fetchSlots.rejected, (state, action) => {
@@ -1704,7 +1779,7 @@ const dashboardSlice = createSlice({
   },
 })
 
-export const { sseStatus, sseYolo, setYoloDuration, sseConnected, sseDisconnected, sseSlots, setSidebarOrder, sseTodoUpdate, sseMcpReportUpdate, touchSlotActivity, setChannelTrusted, sseSlotTitle, sseSlotPatch, addSlotOptimistic, removeSlotOptimistic, releaseCloseHold, awaitCloseOutcome, expireCloseHold, confirmCloseHold, armConfirmedCloseHold, updateSlot, updateSlotFolder, updateSlotPin, updateSlotMuteFlag, setSlotMuteFlagError, triggerRefresh, markSlotUnread, markSlotRead, remoteSlotRead, setUpdateProgress,
+export const { sseStatus, sseYolo, setYoloDuration, sseConnected, sseDisconnected, sseSlots, sseSlotsPartial, sseSlotListHolds, setSidebarOrder, sseTodoUpdate, sseMcpReportUpdate, touchSlotActivity, setChannelTrusted, sseSlotTitle, sseSlotPatch, addSlotOptimistic, removeSlotOptimistic, releaseCloseHold, awaitCloseOutcome, expireCloseHold, confirmCloseHold, armConfirmedCloseHold, updateSlot, updateSlotFolder, updateSlotPin, updateSlotMuteFlag, setSlotMuteFlagError, triggerRefresh, markSlotUnread, markSlotRead, remoteSlotRead, setUpdateProgress,
   setDesktopUpdateAvailable, sseSubagentStatus, sseSubagentText, sseSlotColor, setSessionDefaultColor, setSessionColorsMode, setSessionColorsPalette, setSessionColorsIntensity, setEnabledAppIds, patchSlotSourceLinks, patchSlotLink, dropSlotLinks, setPinRanks, setPendingPinOrder, setPinOrderError } = dashboardSlice.actions
 
 /**
