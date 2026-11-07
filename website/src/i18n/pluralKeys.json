@@ -561,5 +561,9 @@
   "pages.settings.releases.show_more",
   "pages.capabilitiesPage.mcp_servers_waiting",
   "pages.chatPage.mcp_sign_in_needed_more",
-  "pages.overview.skillsTab.also_dismiss_older_updates"
+  "pages.overview.skillsTab.also_dismiss_older_updates",
+  "components.mergeBackDialog.covers",
+  "components.mergeBackDialog.covers_partial",
+  "components.mergeBackDialog.remaining",
+  "pages.chat.mergedFromLabel.messages"
 ]
